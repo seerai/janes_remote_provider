@@ -1,10 +1,10 @@
 import logging
-import geodesic
 import requests
 import time
 import os
 
 from typing import List, Union
+import geopandas as gpd
 from datetime import datetime as _datetime
 
 
@@ -25,7 +25,7 @@ class JanesInstallationsRemoteProvider:
         self.base_url = "https://intara-api.janes.com/graph/"
         self.api_url = "https://intara-api.janes.com/graph/military-groups"
         self.oauth_url = "https://intara-api.janes.com/oauth/token"
-        self.max_page_size = 200
+        self.default_page_size = 500
         self.api_key = os.environ.get("API_KEY")
         self.auth = {
             "clientId": os.environ.get("CLIENT_ID"),
@@ -82,7 +82,6 @@ class JanesInstallationsRemoteProvider:
         fields: Union[List[str], dict] = None,
         sortby: dict = None,
         method: str = "POST",
-        extra_params: dict = None,
         page: int = None,
         page_size: int = None,
         **kwargs,
@@ -114,12 +113,10 @@ class JanesInstallationsRemoteProvider:
         if datetime:
             logger.info(f"Received datetime: {datetime}")
 
-            startdate = _datetime.fromtimestamp(datetime[0].seconds)
-            enddate = _datetime.fromtimestamp(datetime[1].seconds)
+            startdate = datetime[0].strftime("%Y-%m-%dT%H:%M:%SZ")
+            enddate = datetime[1].strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            self.update_filters(
-                f"lastModifiedDate:>={startdate.strftime('%Y-%m-%dT%H:%M:%SZ')},lastModifiedDate:<={enddate.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-            )
+            self.update_filters(f"lastModifiedDate:>={startdate},lastModifiedDate:<={enddate}")
 
         """
         INTERSECTS: Handle provided geometry. Unless the API accepts a geometry, this will be difficult to implement.
@@ -191,22 +188,6 @@ class JanesInstallationsRemoteProvider:
             api_params["sort"] = sortby.get("direction", "asc")
 
         """
-        # EXTRA_PARAMS: Handle extra parameters. These are parameters that are not part of the geodesic standard, but may
-        be passed to the search function. Here, we assume they are queryable API parameters and update the api_params
-        dict with them. They will overwrite any previously passed parameters. Move any parameters that you don't want overwritten
-        below this block
-        """
-        if extra_params:
-            logger.info(f"Received extra parameters: {extra_params.keys()}")
-
-            # If the extra param is a queryable, add it to the request
-            for key in extra_params:
-                if key in self.queryables() and key != "filters":
-                    api_params.update({key: extra_params[key]})
-                elif key == "filters":
-                    self.update_filters(extra_params[key])
-
-        """
         PAGINATION: Handle pagination (page and page_size)
         """
         if "pageNo" in self.queryables():
@@ -216,17 +197,10 @@ class JanesInstallationsRemoteProvider:
 
         return api_params
 
-    def convert_results_to_features(self, response: Union[dict, List[dict]]) -> List[geodesic.Feature]:
+    def convert_results_to_gdf(self, response: Union[dict, List[dict]]) -> gpd.GeoDataFrame:
         """
-        Convert the response from the API to a list of geodesic.Features. We are assuming the response is a list of json/dict.
-        You may need to get the "results" key from the response, depending on the API.
-        The geodesic.Feature class takes:
-        id: str
-        geometry: dict
-        datetime: (str, datetime, datetime64)
-        start_datetime: (str, datetime, datetime64)
-        end_datetime: (str, datetime, datetime64)
-        properties: dict
+        Convert the response from the API to a GeoDataFrame.
+
         The template assumes point features and a single datetime, but this can be modified to handle other geometries
         and multiple datetimes. The remaining outputs from the API response can be added to the properties dictionary.
         """
@@ -238,19 +212,22 @@ class JanesInstallationsRemoteProvider:
             else:
                 response = [response]
 
-        logger.info("Converting API response to geodesic.Features")
-        logger.info(f"Received {len(response)} results. Converting to geodesic.Features.")
+        logger.info(f"Received {len(response)} results. Converting to GeoDataFrame.")
 
         # Check for empty response
         if len(response) == 0:
-            logger.info("No results found.")
-            return []
+            logger.info("No results found. Returning empty GeoDataFrame.")
+            return gpd.GeoDataFrame(columns=["geometry", "id"])
 
         logger.info(f"First result: {response[0]}")
 
-        for observation in response:
+        ID_KEY = "id"
 
-            id = observation.get("id", None)
+        lats = []
+        lons = []
+        datetimes = []
+
+        for observation in response:
 
             # Extract the coordinates from the observation
             location = observation.get("locatedAt", {})
@@ -266,43 +243,39 @@ class JanesInstallationsRemoteProvider:
             else:
                 lat = lon = 0
 
-            geometry = {"type": "Point", "coordinates": [lon, lat]}
+            lats.append(lat)
+            lons.append(lon)
 
             # get last modified date
             obs_datetime = observation.get("datetime", None)
             if obs_datetime:
-                obs_datetime = _datetime.strptime(obs_datetime, "%Y-%m-%dT%H:%M:%S+00:00")
+                obs_datetime = _datetime.strptime(obs_datetime, "%Y-%m-%dT%H:%M:%S+00:00").strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
 
             elif "lastModifiedDate" in observation:
                 obs_datetime = observation.get("lastModifiedDate")
-                obs_datetime = _datetime.strptime(obs_datetime, "%Y-%m-%dT%H:%M:%SZ")
+                obs_datetime = _datetime.strptime(obs_datetime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
 
             else:
-                obs_datetime = ""
+                obs_datetime = "NaT"
 
-            if obs_datetime:
-                feature_dict = {"id": id, "geometry": geometry, "datetime": obs_datetime}
-            else:
-                feature_dict = {"id": id, "geometry": geometry}
+            datetimes.append(obs_datetime)
 
-            feature = geodesic.Feature(**feature_dict)
+        gdf = gpd.GeoDataFrame(
+            response,
+            geometry=gpd.points_from_xy(lons, lats),
+        )
 
-            # Add the remaining properties to the feature
-            if "datetime" in observation:
-                observation.pop("datetime")
+        gdf.set_index(ID_KEY, inplace=True)
 
-            feature["properties"].update(observation)
+        logger.info(f"Converted {len(response)} results to GeoDataFrame of length {len(gdf)}")
 
-            # Add the feature to the list
-            logger.info(f"Created feature: {feature}")
-            features.append(feature)
+        return gdf
 
-        logger.info(f"Converted {len(features)} results to geodesic.Features: {type(features)}")
-        return features
-
-    def request_features(self, **kwargs) -> List[geodesic.Feature]:
+    def request_features(self, **kwargs) -> gpd.GeoDataFrame:
         """
-        Request data from the API and return a list of geodesic.Features. This function is unlikely to need
+        Request data from the API and return a GeoDataFrame. This function is unlikely to need
         modification.
         """
         # Translate the input parameters to API parameters
@@ -332,15 +305,20 @@ class JanesInstallationsRemoteProvider:
             # Parse and use the response data (JSON in this case)
             res = response.json()
 
-            features = self.convert_results_to_features(res)
-            logger.info(f"Received {len(features)} features")
+            # Check if the response is empty
+            if not res:
+                logger.info("No results found. Returning empty GeoDataFrame.")
+                return gpd.GeoDataFrame(columns=["geometry", "id"])
+
+            gdf = self.convert_results_to_gdf(res)
+            logger.info(f"Received {len(gdf)} features")
         else:
             logging.error(f"Error: {response.status_code}")
-            features = []
+            gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
 
-        return features
+        return gdf
 
-    def search(self, pagination={}, provider_properties={}, **kwargs) -> geodesic.FeatureCollection:
+    def search(self, pagination={}, provider_properties={}, **kwargs) -> gpd.GeoDataFrame:
         """Implements the Boson Search endpoint."""
         logger.info("Making request to API.")
         logger.info(f"Search received kwargs: {kwargs}")
@@ -352,17 +330,22 @@ class JanesInstallationsRemoteProvider:
         We will pass "page" and "page_size" to the request_features function.
         """
         page = 1
-        page_size = self.max_page_size
+        page_size = self.default_page_size
         limit = kwargs.get("limit", None)
         if limit == 0:
             limit = None
         if limit is not None:
-            page_size = limit if limit <= self.max_page_size else self.max_page_size
+            page_size = limit if limit <= self.default_page_size else self.default_page_size
 
         if pagination and "page" in pagination and "page_size" in pagination:
             logger.info(f"Received pagination: {pagination}")
-            page = pagination.get("page", 1)
-            page_size = pagination.get("page_size", self.max_page_size)
+            page = pagination.get("page", None)
+            if page == 0:
+                logger.info("Received page 0. Setting page to 1")
+                page = 1
+
+            page_size = pagination.get("page_size", self.default_page_size)
+
         elif pagination:
             logger.info(f"Received pagination w/o page and/or page_size: {pagination}")
             pagination = {}
@@ -375,31 +358,20 @@ class JanesInstallationsRemoteProvider:
             logger.info(f"Received provider_properties from boson_config.properties: {provider_properties}")
             # TODO: Update kwargs with relevant keys from provider_properties, or otherwise pass them along
 
-        features = self.request_features(page=page, page_size=page_size, **kwargs)
+        gdf = self.request_features(page=page, page_size=page_size, **kwargs)
 
-        # logger.info("type of features[0]: ", type(features[0]))
-
-        logger.info(f"trying to make fc")
-        if features:
-            fc = geodesic.FeatureCollection(features=features)
-        else:
-            fc = geodesic.FeatureCollection()
-        logger.info(f"fc: {fc}")
-        logger.info(f"type of fc: {type(fc)}")
-
-        # logger.info(f"type of fc[0]: {type(fc['features'][0])}")
-        # logger.info(f"fc[0]: {fc['features'][0]}")
         logger.info(f"making pagination dict")
         pagination_dict = {"page": page + 1, "page_size": page_size}
         logger.info(f"pagination_dict: {pagination_dict}")
-        logger.info(f"type of pagination_dict: {type(pagination_dict)}")
 
         logger.info("returning search")
-
+        logger.info(f"Returning gdf of type: {type(gdf)} with length {len(gdf)}")
+        logger.info(gdf.head())
+        logger.info(f"datatypes of columns are: {gdf.dtypes}")
         # Reset all
         logger.info("Resetting all by running __init__")
         self.__init__()
-        return fc, pagination_dict
+        return gdf, pagination_dict
 
     def queryables(self, **kwargs) -> dict:
         """
