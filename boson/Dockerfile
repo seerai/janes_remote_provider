@@ -1,4 +1,4 @@
-FROM python:3.8-slim-buster as builder
+FROM python:3.10-slim-buster as builder
 
 # Update base container install
 RUN apt-get update \
@@ -15,15 +15,9 @@ RUN printf "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/" >> /ro
 
 WORKDIR /app
 COPY requirements.txt .
-#RUN --mount=type=ssh ssh-agent
-#RUN --mount=type=ssh ssh-add
 RUN --mount=type=ssh,id=github_ssh_key pip install --user -r requirements.txt
-#RUN --mount=type=ssh ssh-agent sh -c 'ssh-add && pip install --user -r requirements.txt'
-#RUN --mount=type=ssh pip install --user -r requirements.txt
 
-RUN ls -la /root/.local
-
-FROM python:3.8-slim-buster as runner
+FROM python:3.10-slim-buster as runner
 COPY --from=builder /root/.local /root/.local
 
 WORKDIR /app
